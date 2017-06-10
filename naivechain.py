@@ -1,12 +1,15 @@
 from enum import Enum
+import sys
 import time
 from collections import UserList
 from hashlib import blake2b
 from itertools import chain, islice
 from json import dumps, loads
 from pprint import pprint, pformat
-import websockets
 import asyncio
+import websockets
+from sanic import Sanic
+from sanic.response import json, text
 
 class Block(object):
     """docstring for Block."""
@@ -58,14 +61,15 @@ class Blockchain(UserList):
             self.data.append(genesis)
 
     def add_block(self, block_data):
-        self.data.append(Block(data=block_data, prev_block=self.latest_block))
+        print("Adding block with data:\n\t", block_data)
+        self.data.append(Block(data=block_data, prev_block=self.latest))
 
     @property
-    def genesis_block(self):
+    def genesis(self):
         return self.data[0]
 
     @property
-    def latest_block(self):
+    def latest(self):
         return self.data[-1]
 
     def is_valid(self):
@@ -85,7 +89,7 @@ class MessageType(Enum):
     QUERY_LATEST = 0
     QUERY_ALL = 1
     RESPONSE_BLOCKCHAIN = 2
-    RESPONSE_LATEST_BLOCK = 3
+    RESPONSE_LATEST = 3
 
 class Message(object):
     def __init__(self, msg_type, data=None, **kwargs):
@@ -99,8 +103,8 @@ class Message(object):
             return d
         elif self.msg_type is MessageType.RESPONSE_BLOCKCHAIN:
             return {**d, 'data': blockchain.asdict()}
-        elif self.msg_type is MessageType.RESPONSE_LATEST_BLOCK:
-            return {**d, 'data': blockchain.latest_block.asdict()}
+        elif self.msg_type is MessageType.RESPONSE_LATEST:
+            return {**d, 'data': blockchain.latest.asdict()}
 
 
 def replace_chain(new_chain):
@@ -108,12 +112,11 @@ def replace_chain(new_chain):
     if new_chain.is_valid() and len(new_chain) > len(blockchain):
         print('Received blockchain is valid and longer. Replacing original')
         blockchain = new_chain
-        # TODO: broadcast latest block to all peers
+        broadcast_queue.put(Message(MessageType.RESPONSE_LATEST))
     else:
         print('Received blockchain invalid! Discarding')
 
-def json_decoder(json):
-    obj = loads(json)
+def dict_decoder(obj):
     if obj['__type__'] == 'Message':
         return Message(**obj)
     elif obj['__type__'] == 'Block':
@@ -122,29 +125,64 @@ def json_decoder(json):
         obj['blocks'] = [Block(**b) for b in obj['blocks']]
         return Blockchain(**obj)
 
-async def handle_message(message, connection):
-    if message.msg_type == MessageType.QUERY_ALL:
-        await connection.msg_queue.put(Message(MessageType.RESPONSE_BLOCKCHAIN))
-    elif message.msg_type == MessageType.QUERY_LATEST:
-        await connection.msg_queue.put(Message(MessageType.RESPONSE_LATEST_BLOCK))
-    elif message.msg_type in (MessageType.RESPONSE_BLOCKCHAIN, MessageType.RESPONSE_LATEST_BLOCK):
-        await handle_response(message.data)
+def json_decoder(json):
+    obj = loads(json)
+    return dict_decoder(obj)
 
-async def handle_response(data):
+async def response_data_decoder(data_dict):
+    data = dict_decoder(data_dict)
     if isinstance(data, Blockchain):
-        recv_latest_block = data.latest_block
+        return data.latest
         recv_blockchain = data
-    else:
-        recv_latest_block = data
+    elif isinstance(data, Block):
+        recv_latest = data
         recv_blockchain = None
-    latest_block = blockchain.latest_block
-    if recv_latest_block.index > latest_block.index:
-        if recv_latest_block.prev_hash == latest_block.hash:
-            blockchain.append(recv_latest_block)
-        elif recv_blockchain is None:
-            await message_queue.put(Message(MessageType.QUERY_ALL))
+    else:
+        print("Unknown response data")
+        return
+
+async def handle_message(message, connection):
+    if message.msg_type is MessageType.QUERY_ALL:
+        await connection.msg_queue.put(Message(MessageType.RESPONSE_BLOCKCHAIN))
+    elif message.msg_type is MessageType.QUERY_LATEST:
+        await connection.msg_queue.put(Message(MessageType.RESPONSE_LATEST))
+    elif message.msg_type is MessageType.RESPONSE_BLOCKCHAIN:
+        await handle_blockchain_response(dict_decoder(message.data), connection)
+    elif message.msg_type is MessageType.RESPONSE_LATEST:
+        await handle_latest_block_response(dict_decoder(message.data), connection)
+
+async def handle_blockchain_response(recv_blockchain, conn):
+    if await handle_latest_block_response(recv_blockchain.latest, conn):
+        return
+    elif recv_blockchain.is_valid():
+        print("blockchain out of sync! Replacing with received")
+        replace_chain(recv_blockchain)
+    else:
+        print('Received invalid blockchain!')
+
+async def handle_latest_block_response(recv_latest, conn):
+    latest = blockchain.latest
+    pprint(recv_latest.asdict())
+    pprint(latest.asdict())
+    if recv_latest.hash == latest.hash:
+        print("Identical hashes, blockchains in sync")
+    elif recv_latest.index > latest.index:
+        print(f'index larger recv:{recv_latest.index} > latest:{latest.index}')
+        if recv_latest.prev_hash == latest.hash:
+            print("good block, appending to blockchain")
+            print(f'recv.prev_hash:{recv_latest.prev_hash} == latest.hash:{latest.hash}')
+            blockchain.append(recv_latest)
         else:
-            replace_chain(recv_blockchain)
+            await broadcast_queue.put(Message(MessageType.QUERY_ALL))
+            return False
+    elif recv_latest.index < latest.index:
+        ahead = latest.index - recv_latest.index
+        print(f'Local blockchain ahead by {ahead} blocks')
+        if ahead > 1:
+            await conn.msg_queue.put(Message(MessageType.RESPONSE_BLOCKCHAIN))
+        else:
+            await conn.msg_queue.put(Message(MessageType.RESPONSE_LATEST))
+    return True
 
 
 class Connection(object):
@@ -153,19 +191,25 @@ class Connection(object):
         self.ws = websocket
         self.msg_queue = asyncio.Queue()
 
+    def __str__(self):
+        return pformat({**self.asdict(), 'msg_queue_empty' : self.msg_queue.empty})
+
+    def asdict(self):
+        return {'remote_address': '{}:{}'.format(*self.ws.remote_address),
+                'local_address': '{}:{}'.format(*self.ws.local_address)}
+
     async def consumer_handler(self):
         while True:
             json_message = await self.ws.recv()
-            print("recv", json_message)
             message = json_decoder(json_message)
-            pprint(message.asdict())
+            print("RECV ->", self.asdict(), message.msg_type)
             await handle_message(message, self)
 
     async def producer_handler(self):
         while True:
             message = await self.msg_queue.get()
+            print("SEND ->", self.asdict(), message.msg_type)
             json_message = dumps(message.asdict())
-            print("send", json_message)
             await self.ws.send(json_message)
 
     async def handler(self):
@@ -175,44 +219,90 @@ class Connection(object):
             [consumer_task, producer_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
-
+        pprint(done)
         for task in pending:
             task.cancel()
 
-
 connections = set()
 
-async def conn_handler(ws, path):
-    print("WOW", path, ws)
+async def connect_to_peer(remote_address, sync=False):
+    print("Trying to connect to", remote_address)
+    ws = await websockets.connect(f'ws://{remote_address}')
+    await conn_handler(None, ws, sync=sync)
+
+app = Sanic()
+
+@app.route('/block/<index:int>', methods=['GET'])
+async def get_blockchain(request, index):
+    return json(blockchain[index].asdict())
+
+@app.route('/block/<hash>', methods=['GET'])
+async def get_blockchain(request, hash):
+    return json(next((b.asdict() for b in blockchain if b.hash == hash), None))
+
+@app.route('/block', methods=['GET'])
+async def get_blockchain(request):
+    return json(blockchain.asdict())
+
+@app.route('/block', methods=['POST'])
+async def add_block(request):
+    data = request.json['data']
+    assert isinstance(data, str)
+    blockchain.add_block(data)
+    await broadcast_queue.put(Message(MessageType.RESPONSE_LATEST))
+    return json(blockchain.latest.asdict())
+
+@app.route('/peer', methods=['GET'])
+async def list_peers(request):
+    return json([conn.asdict() for conn in connections])
+
+@app.route('/peer', methods=['POST'])
+async def add_peer(request):
+    print(type(request.json))
+    print(request.json)
+    asyncio.ensure_future(connect_to_peer(request.json['remote_address'], sync=True))
+    return text("peer connected")
+
+@app.websocket('/')
+async def conn_handler(request, ws, sync=False):
     global connections
     conn = Connection(ws)
+    if sync:
+        await conn.msg_queue.put(Message(MessageType.QUERY_LATEST))
     connections.add(conn)
+    print("peer connected ", ws.remote_address, "total connections", len(connections))
     try:
         await asyncio.wait([c.handler() for c in connections])
     finally:
+        print("Closed connection:", conn.asdict())
         connections.remove(conn)
 
-message_queue = asyncio.Queue()
+@app.listener('after_server_start')
+async def init_peers_and_broadcast(app, loop):
+    global broadcast_queue
+    broadcast_queue = asyncio.Queue(loop=loop)
+    await connect_to_initial_peers()
+    await broadcast()
+
+
+async def connect_to_initial_peers():
+    if len(sys.argv) > 2:
+        for peer in sys.argv[2].split(';'):
+            asyncio.ensure_future(connect_to_peer(peer, sync=True))
+
+async def broadcast():
+    while True:
+        message = await broadcast_queue.get()
+        print("Message in broadcast queue")
+        pprint(message.asdict())
+        for conn in connections:
+            try:
+                print("pushing message to", conn.asdict())
+                await conn.msg_queue.put(message)
+            except Exception as e:
+                pass
+
 
 blockchain = Blockchain()
-blockchain.add_block("Memes are real")
-blockchain.add_block("Pepe is the shit")
-print(blockchain)
 
-print()
-print("Valid blockchain() =>", blockchain.is_valid())
-
-chain_json = dumps(blockchain.asdict())
-print(chain_json)
-newchain = json_decoder(chain_json)
-
-print()
-print("Valid blockchain() =>", newchain.is_valid())
-
-print()
-print(Message(MessageType.RESPONSE_BLOCKCHAIN).asdict())
-
-p2pserver = websockets.serve(conn_handler, 'localhost', 6001)
-
-asyncio.get_event_loop().run_until_complete(p2pserver)
-asyncio.get_event_loop().run_forever()
+app.run(host="0.0.0.0", port=str(sys.argv[1]))
