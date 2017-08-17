@@ -1,0 +1,2 @@
+websockets>=3.3
+sanic>=0.6.0
